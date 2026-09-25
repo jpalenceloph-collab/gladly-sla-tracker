@@ -9,8 +9,8 @@
 // @grant        GM_getValue
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
-// @updateURL    https://raw.githubusercontent.com/YOUR-GITHUB-USERNAME/gladly-sla-tracker/main/Gladly-SLA-Tracker.user.js
-// @downloadURL  https://raw.githubusercontent.com/YOUR-GITHUB-USERNAME/gladly-sla-tracker/main/Gladly-SLA-Tracker.user.js
+// @updateURL    https://raw.githubusercontent.com/jpalenceloph-collab/gladly-sla-tracker/edit/main/Gladly-SLA-Tracker.user.js
+// @downloadURL  https://raw.githubusercontent.com/jpalenceloph-collab/gladly-sla-tracker/edit/main/Gladly-SLA-Tracker.user.js
 // @run-at       document-idle
 // ==/UserScript==
 
