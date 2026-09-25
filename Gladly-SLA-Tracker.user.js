@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gladly SLA Tracker + Liveboard Monitor
 // @namespace    gladly-sla-tracker
-// @version      2.8.4
+// @version      2.8.5
 // @description  ...
 // @match        https://*.gladly.com/*
 // @grant        GM_xmlhttpRequest
