@@ -1,17 +1,17 @@
 // ==UserScript==
 // @name         Gladly SLA Tracker + Liveboard Monitor
 // @namespace    gladly-sla-tracker
-// @version      2.8.3
-// @description  SLA Tracker + Liveboard Monitor
+// @version      2.8.1
+// @description  ...
 // @match        https://*.gladly.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
+// @updateURL    https://raw.githubusercontent.com/YOUR-GITHUB-USERNAME/gladly-sla-tracker/main/Gladly-SLA-Tracker.user.js
+// @downloadURL  https://raw.githubusercontent.com/YOUR-GITHUB-USERNAME/gladly-sla-tracker/main/Gladly-SLA-Tracker.user.js
 // @run-at       document-idle
-// @updateURL    https://script.google.com/macros/s/AKfycbx8CGYLXNSg55lPUcqZ_RsxbAQOoBhNvAkRIk_QyF_D7RBKB-M4uWw-JyXJuPn83ZQ/exec
-// @downloadURL  https://script.google.com/macros/s/AKfycbx8CGYLXNSg55lPUcqZ_RsxbAQOoBhNvAkRIk_QyF_D7RBKB-M4uWw-JyXJuPn83ZQ/exec
 // ==/UserScript==
 
 (function () {
