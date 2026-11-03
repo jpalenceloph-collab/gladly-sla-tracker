@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Gladly SLA Tracker + Liveboard Monitor
 // @namespace    gladly-sla-tracker
-// @version      3.6.0
-// @description  Command Center for Gladly: Email SLA, Open Email SLA, Agent Liveboard alerts and Airplane Mode in one docked panel, fed by hidden background frames. Same behaviour as the Gladly Command Center Chrome extension.
+// @version      3.14.0
+// @description  Command Center for Gladly: Email SLA (18h), Open Email SLA, Agent Liveboard alerts with department filter, Break check (Gladly vs Break Tracker) and Airplane Mode in one docked panel, fed by hidden background frames. Same behaviour as the Gladly Command Center Chrome extension.
 // @match        https://*.gladly.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
@@ -11,17 +11,21 @@
 // @grant        GM_notification
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
+// @connect      googleusercontent.com
 // @updateURL    https://raw.githubusercontent.com/jpalenceloph-collab/gladly-sla-tracker/main/Gladly-SLA-Tracker.user.js
 // @downloadURL  https://raw.githubusercontent.com/jpalenceloph-collab/gladly-sla-tracker/main/Gladly-SLA-Tracker.user.js
 // @run-at       document-idle
 // ==/UserScript==
 
-// Ported from Gladly Command Center (Chrome extension) v3.6.0.
+// Ported from Gladly Command Center (Chrome extension) v3.14.0 + the new tab bar / Email SLA summary.
 // The extension shows its dashboard in Chrome's side panel; a userscript can't, so the same
-// dashboard is docked on the right edge of the Gladly page (launcher tab, ↔ to widen, ✕ to hide).
+// dashboard is docked on the right edge of the Gladly page (launcher tab "CC", ↔ to widen, ✕ to hide).
+// Break check: click 🕵️ in the dock header once and paste your Live Break Monitor web app URL (ends in /exec).
 
 (function () {
   'use strict';
+
+
   /************************************************************
    * CONFIG
    ************************************************************/
@@ -74,32 +78,22 @@
   const TOGGLE_COUNT_THRESHOLD = 3;
   const TOGGLE_WINDOW_MS = 5 * 60 * 1000;
   const REPEAT_ALERT_COOLDOWN_MS = 5 * 1000;
-  const SLA_HOURS = 12;
+  const SLA_HOURS = 18;            // Email SLA window (new AND open email). Drives the panel title and the "beyond SLA" check.
+  const SLA_SLACK_MIN = 10;        // a due time further out than SLA_HOURS + this is flagged as not matching the SLA
   const NOTIFY_THRESHOLD_MIN = 30;
 
-  const MONITORED_AGENTS = new Set([
-    "Aaron T.", "Abiatar N.", "Alex L.", "Anna D.", "Anthony M.", "Aris N", "Aurora L.", "Ayessa Dane D.",
-    "Bea Gabrielle B.", "Belle E.", "Carl I.", "Carla M.", "Chelsea Mae T.", "Chezka G.", "Chezka Joy G.",
-    "Christian Dave D.", "Christian T.", "Claytie N.", "Cristine O.", "Cyril T.", "Dane A.", "Danica A.",
-    "Daniel C.", "Daniel S.", "Dominique T.", "Edwin D.", "Eiriyel Roy A.", "Emmanuel M.", "Fergie G",
-    "Gerald T.", "Hadji Q.", "Hannah C", "Hanz G.", "Hasna H.", "Ilias D.", "Ivee B.", "Jaimee V.", "Jan Q.",
-    "Jane O.", "Janine Joyce O.", "Jay C.", "Jaymie M.", "Jeal D.", "Jemuel E.", "Jennifer G", "Jenny P.",
-    "Jerome F.", "Jessica B.", "Jessie C.", "Jiulian P.", "Joey L.", "John Ashley P.", "John Carlo N.",
-    "John P.", "Jorge T.", "Joseph C.", "Joshua B.", "Jovan B.", "Juliet N.", "June Lee A.", "Justin Y.",
-    "Kate B.", "Kazandra A.", "Ken P.", "Kenneth Kyle H.", "Kent D.", "Khyl N.", "Kristel Marivic S.",
-    "Kyle G", "Kylle S.", "MA.Elena T.", "Margie Lyn B.", "Maria U.", "Marienne L.", "Mark C", "Mark T.",
-    "Mary A.", "Mary Antoneth U.", "Mary S.", "Matt A.", "Mauie C", "Maybel B.", "Merie R.", "Nikki C.",
-    "Niño Jay C.", "Norallyza C.", "Orligene B.", "Paul R.", "Paulo Z.", "Ralph B.", "Raynier M.",
-    "Rhaine T.", "Rian Nicole R.", "Rianne A.", "Rishierl C.", "Rouen P.", "Shamaika S.", "Sharica C.",
-    "Sherwin D.", "Sofia D.", "Ulycis G.", "Xyrine Nicole A.", "Zyreen P."
-  ]);
+  // Agent names and departments are NOT hard-coded: they come from the Live Break Monitor feed (see getRoster below).
 
+  // Each pill is a separate time-left range (an email is counted in exactly one pill).
+  const SLA_MAX_MS = SLA_HOURS * 3600000 + SLA_SLACK_MIN * 60000;
   const BUCKETS = [
-    { label: 'OVERDUE',   max: 0,                  color: '#fca5a5', bg: 'rgba(239,68,68,.20)',  lc: '#b91c1c', lbg: 'rgba(239,68,68,.12)' },
-    { label: 'Due < 1h',  max: 3600000,            color: '#fdba74', bg: 'rgba(249,115,22,.18)', lc: '#c2410c', lbg: 'rgba(249,115,22,.12)' },
-    { label: 'Due < 3h',  max: 3 * 3600000,        color: '#fcd34d', bg: 'rgba(245,158,11,.16)', lc: '#a16207', lbg: 'rgba(245,158,11,.16)' },
-    { label: 'Due < 6h',  max: 6 * 3600000,        color: '#bef264', bg: 'rgba(132,204,22,.14)', lc: '#4d7c0f', lbg: 'rgba(132,204,22,.18)' },
-    { label: 'Due later', max: Infinity,           color: '#86efac', bg: 'rgba(34,197,94,.15)',  lc: '#15803d', lbg: 'rgba(34,197,94,.14)' },
+    { label: 'Overdue',     max: 0,                  color: '#fb7185', bg: 'rgba(251,113,133,.18)', lc: '#e11d48', lbg: 'rgba(225,29,72,.10)' },
+    { label: '0-1h left',   max: 3600000,            color: '#fdba74', bg: 'rgba(249,115,22,.18)', lc: '#c2410c', lbg: 'rgba(249,115,22,.12)' },
+    { label: '1-3h left',   max: 3 * 3600000,        color: '#fcd34d', bg: 'rgba(245,158,11,.16)', lc: '#a16207', lbg: 'rgba(245,158,11,.16)' },
+    { label: '3-6h left',   max: 6 * 3600000,        color: '#bef264', bg: 'rgba(132,204,22,.14)', lc: '#4d7c0f', lbg: 'rgba(132,204,22,.18)' },
+    { label: '6-12h left',  max: 12 * 3600000,       color: '#5eead4', bg: 'rgba(20,184,166,.15)', lc: '#0f766e', lbg: 'rgba(20,184,166,.14)' },
+    { label: '12-18h left', max: SLA_MAX_MS,         color: '#86efac', bg: 'rgba(34,197,94,.15)',  lc: '#15803d', lbg: 'rgba(34,197,94,.14)' },
+    { label: 'Over 18h',    max: Infinity,           color: '#a5b4fc', bg: 'rgba(99,102,241,.18)', lc: '#4338ca', lbg: 'rgba(99,102,241,.12)' },
   ];
 
   /************************************************************
@@ -108,6 +102,7 @@
   const isTop = window.top === window.self;
   // Userscript: the dashboard is drawn inside the top Gladly page (docked panel).
   const IS_VIEWER = false;
+  const IS_CRAWLER_TAB = false;
 
   function roleOfPath(p, q) {
     for (const r of ROLES) if (VIEWS[r].test(p, q)) return r;
@@ -439,7 +434,7 @@
    * DASHBOARD (top frame only)
    ************************************************************/
   let framesEnabled = GM_getValue('framesEnabled', true);
-  let theme = GM_getValue('gcc_theme', 'dark');
+  let theme = GM_getValue('gcc_theme', (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark');
   const BC = (b) => (theme === 'light' ? b.lc : b.color);
   const BB = (b) => (theme === 'light' ? b.lbg : b.bg);
 
@@ -447,7 +442,7 @@
   // frames and posts to the webhook, so nothing is read/sent twice.
   const TAB_ID = Math.random().toString(36).slice(2);
   function amLeader() {
-    if (IS_VIEWER) return false;
+    if (IS_VIEWER || IS_CRAWLER_TAB) return false;
     const l = GM_getValue('gcc_leader', null);
     const now = Date.now();
     if (!l || now - l.ts > 10000 || l.id === TAB_ID) {
@@ -458,11 +453,11 @@
   }
   let currentTab = GM_getValue('tab', 'all');
   let collapsed = GM_getValue('collapsed', false);
-  const bucketSets = { email: new Set(['OVERDUE', 'Due < 1h']), emailopen: new Set(['OVERDUE', 'Due < 1h']) };
+  const bucketSets = { email: new Set(['Overdue', '0-1h left']), emailopen: new Set(['Overdue', '0-1h left']) };
   let notifyEnabled = GM_getValue('notifyEnabled', false);
   let notifiedIds = new Set(JSON.parse(GM_getValue('notifiedIds', '[]')));
 
-  const feeds = { email: feedGet('email'), emailopen: feedGet('emailopen'), agents: feedGet('agents'), airplane: feedGet('airplane') };
+  const feeds = { email: feedGet('email'), emailopen: feedGet('emailopen'), agents: feedGet('agents'), airplane: feedGet('airplane'), lbm: feedGet('lbm') };
   ROLES.forEach((r) => {
     if (typeof GM_addValueChangeListener === 'function') {
       GM_addValueChangeListener(feedKey(r), (n, o, val) => {
@@ -472,6 +467,14 @@
       });
     }
   });
+
+  if (typeof GM_addValueChangeListener === 'function') {
+    GM_addValueChangeListener(feedKey('lbm'), (n, o, val) => {
+      try { feeds.lbm = JSON.parse(val); } catch (e) { return; }
+      refreshAlerts();
+      scheduleRender();
+    });
+  }
 
   /* ---------- hidden frames ---------- */
   let framesHost = null;
@@ -522,7 +525,7 @@
     }
   }
   function sendWebhook(payload) {
-    if (!WEBHOOK_URL || !amLeader()) return; // only one Gladly tab reports
+    if (quietEval || !WEBHOOK_URL || !amLeader()) return; // only one Gladly tab reports
     hookQueue.push(payload);
     while (hookQueue.length > HOOK_MAX_QUEUE) hookQueue.shift(); // drop oldest if Google can't keep up
     hookPump();
@@ -535,13 +538,15 @@
     nobubble:   { title: '🫧 No Bubbles',    accent: '#f97316' },
     underchats: { title: '📉 Under 3 Chats', accent: '#a855f7' },
     longchat:   { title: '💬 Long Chats',    accent: '#3b82f6' },
+    brk_notag:  { title: '🕵️ Away in Gladly, not tagged in Break Tracker', accent: '#ef4444' },
+    brk_work:   { title: '🏃 Break in tracker, still Work in Gladly',       accent: '#f59e0b' },
+    brk_type:   { title: '🔀 Break type differs (Gladly vs tracker)',       accent: '#eab308' },
   };
   const activeAlerts = new Map();
   const agentHistory = new Map();
   const bubbleTimers = new Map();
   let lastAgentsTs = 0;
 
-  const isMonitored = (n) => MONITORED_AGENTS.has(n);
   function setAlert(agent, type, detail) {
     const key = agent + '::' + type;
     if (!activeAlerts.has(key)) activeAlerts.set(key, { agent, type, detail, since: Date.now() });
@@ -557,7 +562,7 @@
     if (snap !== lastAlertSnap) { lastAlertSnap = snap; GM_setValue('gcc_alerts', snap); }
   }
   function refreshAlerts() {
-    if (amLeader()) { processAgents(); publishAlerts(); }
+    if (amLeader()) { processAgents(); evaluateBreakCheck(); publishAlerts(); }
     else { loadAlerts(); } // another Gladly tab is the leader: mirror its alerts
   }
   function loadAlerts() {
@@ -568,16 +573,188 @@
   }
   GM_addValueChangeListener('gcc_alerts', (k, o, n, remote) => { if (remote) { loadAlerts(); scheduleRender(); } });
 
+  /* ---------- break check: Gladly status vs Break Tracker (Live Break Monitor feed) ---------- */
+  // Gladly "away" reason -> tracker break types that may match it
+  const BRK_MAP = { break: ['first', 'last'], meal: ['lunch'], restroom: ['bio'] };
+  const BRK_LABEL = { first: 'First break', lunch: 'Lunch', last: 'Last break', bio: 'Bio break' };
+  const BRK_GRACE_MIN = 1;            // minutes in a status before a difference counts
+  const BRK_PERSIST_MS = 20000;       // the difference must hold this long (tracker / Gladly can lag a few seconds)
+  const BRK_RENOTIFY_MS = 10 * 60000; // same agent + same problem: notify at most this often
+  const LBM_POLL_MS = 10000;
+  const LBM_STALE_MS = 45000;
+  const normName = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const brkSince = new Map();
+  const brkNotified = new Map();
+
+  /* ---------- roster: agent names + departments from the Live Break Monitor feed ---------- */
+  const deptOf = (p) => String((p && (p.d || p.dept || p.department)) || '').trim();
+  let rosterSrc = null, rosterMap = new Map(), rosterDepts = [];
+  function getRoster() {
+    const people = (feeds.lbm && feeds.lbm.people) || [];
+    if (people !== rosterSrc) {
+      rosterSrc = people;
+      rosterMap = new Map();
+      const ds = new Set();
+      people.forEach((p) => {
+        const k = normName(p && p.n);
+        if (!k) return;
+        rosterMap.set(k, p);
+        const d = deptOf(p);
+        if (d) ds.add(d);
+      });
+      rosterDepts = Array.from(ds).sort();
+    }
+    return rosterMap;
+  }
+  const personOf = (name) => getRoster().get(normName(name));
+  const deptOfAgent = (name) => deptOf(personOf(name));
+  const deptFilter = () => { const a = GM_getValue('gcc_dept_filter', []); return Array.isArray(a) ? a : []; };
+  const deptInScope = (p) => { const f = deptFilter(); return !f.length || f.indexOf(deptOf(p)) >= 0; };
+  // an agent is monitored when the Live Break Monitor knows them (and their department is not filtered out)
+  function isMonitored(name) { const p = personOf(name); return !!p && deptInScope(p); }
+  // display filter: with a department selected, only agents of that department are listed
+  const alertInScope = (name) => !deptFilter().length || deptInScope(personOf(name));
+
+  function compareBreaks() {
+    const lf = feeds.lbm, af = feeds.agents, now = Date.now();
+    const out = { ready: false, matched: 0, unmatched: 0, desired: new Map() };
+    if (!lf || !lf.ok || !lf.okTs || now - lf.okTs > LBM_STALE_MS) return out;
+    if (!af || !af.rows || now - af.ts > VIEWS.agents.staleMs) return out;
+    out.ready = true;
+    const rmap = getRoster();
+    const add = (agent, type, detail) => out.desired.set(agent + '::' + type, { agent, type, detail });
+    af.rows.forEach((row) => {
+      const p = rmap.get(normName(row.agent));
+      if (!p) { out.unmatched++; return; }
+      if (!deptInScope(p)) return;
+      out.matched++;
+      const st = String(row.status || '').trim().toLowerCase();
+      const gmin = parseMinutes(row.statusDurationText);
+      const tb = p.b;                                   // live break in the tracker, or null
+      const allowed = BRK_MAP[st];
+      if (allowed) {
+        if (!tb) {
+          if (gmin >= BRK_GRACE_MIN) add(row.agent, 'brk_notag', row.status + ' for ' + row.statusDurationText + ' in Gladly, no live break in the tracker');
+        } else if (allowed.indexOf(tb.t) < 0) {
+          add(row.agent, 'brk_type', 'Gladly: ' + row.status + ' / Tracker: ' + (BRK_LABEL[tb.t] || tb.t));
+        }
+      } else if (st === 'work' && tb) {
+        const tmin = Math.max(0, (now - tb.st) / 60000);
+        if (tmin >= BRK_GRACE_MIN && gmin >= BRK_GRACE_MIN) {
+          add(row.agent, 'brk_work', 'Tracker: ' + (BRK_LABEL[tb.t] || tb.t) + ' ' + Math.floor(tmin) + 'm / Gladly: Work ' + row.statusDurationText);
+        }
+      }
+    });
+    return out;
+  }
+
+  function notifyBreak(key, v, now) {
+    if (IS_VIEWER || !amLeader() || !GM_getValue('gcc_brk_notify', true)) return;
+    if (now - (brkNotified.get(key) || 0) < BRK_RENOTIFY_MS) return;
+    brkNotified.set(key, now);
+    try {
+      GM_notification({ title: 'Break check: ' + v.agent, text: v.detail, timeout: 0 });
+    } catch (e) { console.error('[GCC] notify failed', e); }
+  }
+
+  function evaluateBreakCheck() {
+    if (IS_VIEWER) return;
+    const now = Date.now();
+    const types = ['brk_notag', 'brk_work', 'brk_type'];
+    const cmp = compareBreaks();
+    if (!cmp.ready) {
+      // no fresh data: keep what is showing for a while, then drop it rather than show stale alarms
+      const okTs = feeds.lbm && feeds.lbm.okTs;
+      if (!okTs || now - okTs > 3 * 60000) {
+        Array.from(activeAlerts.keys()).forEach((k) => { if (types.indexOf(activeAlerts.get(k).type) >= 0) activeAlerts.delete(k); });
+        brkSince.clear();
+      }
+      return;
+    }
+    cmp.desired.forEach((v, key) => { if (!brkSince.has(key)) brkSince.set(key, now); });
+    Array.from(brkSince.keys()).forEach((k) => { if (!cmp.desired.has(k)) brkSince.delete(k); });
+    Array.from(activeAlerts.keys()).forEach((k) => {
+      const a = activeAlerts.get(k);
+      if (types.indexOf(a.type) >= 0 && !(cmp.desired.has(k) && now - brkSince.get(k) >= BRK_PERSIST_MS)) activeAlerts.delete(k);
+    });
+    cmp.desired.forEach((v, key) => {
+      if (now - brkSince.get(key) < BRK_PERSIST_MS) return;
+      setAlert(v.agent, v.type, v.detail);
+      notifyBreak(key, v, now);
+    });
+  }
+
+  const LBM_URL_RE = /^https:\/\/script\.google\.com\/(a\/[^/]+\/)?macros\/s\/[^/]+\/(exec|dev)$/;
+  // reads the Live Break Monitor JSON feed with the user's Google sign-in (cookies are sent)
+  function lbmFetch(url) {
+    return new Promise((resolve) => {
+      const base = String(url || '').split('?')[0];
+      if (!LBM_URL_RE.test(base)) return resolve({ error: 'bad url' });
+      try {
+        GM_xmlhttpRequest({
+          method: 'GET', url: base + '?feed=live', anonymous: false, timeout: 20000,
+          onload: (r) => {
+            let j;
+            try { j = JSON.parse(r.responseText); } catch (e) { return resolve({ error: 'Not signed in to Google, or the monitor was not redeployed with the feed (HTTP ' + r.status + ').' }); }
+            resolve(j && j.ok ? { data: j } : { error: (j && j.error) || 'monitor returned an error' });
+          },
+          onerror: () => resolve({ error: 'network error' }),
+          ontimeout: () => resolve({ error: 'timeout' }),
+        });
+      } catch (e) { resolve({ error: String((e && e.message) || e) }); }
+    });
+  }
+  let lbmBusy = false;
+  async function pollMonitor() {
+    if (IS_VIEWER || IS_CRAWLER_TAB || lbmBusy || !amLeader()) return;
+    const url = GM_getValue('lbm_url', '');
+    if (!url) return;
+    lbmBusy = true;
+    const prev = feeds.lbm || {};
+    try {
+      const r = await lbmFetch(url);
+      const next = r && r.data
+        ? { ok: true, okTs: Date.now(), people: r.data.people || [] }
+        : { ok: false, error: (r && r.error) || 'no answer from the monitor', okTs: prev.okTs || 0, people: prev.people || [] };
+      feeds.lbm = Object.assign({ ts: Date.now() }, next);
+      feedSet('lbm', next);
+    } catch (e) { console.error('[GCC] monitor poll failed', e); }
+    lbmBusy = false;
+    refreshAlerts();
+  }
+
+  function breakCheckBar() {
+    const on = GM_getValue('gcc_brk_notify', true);
+    const lf = feeds.lbm, url = GM_getValue('lbm_url', '');
+    let txt;
+    if (!url) txt = 'Break check is off. Click 🕵️ in the header and paste your Live Break Monitor URL.';
+    else if (!lf) txt = 'Break check: waiting for the Live Break Monitor feed…';
+    else if (!lf.ok && (!lf.okTs || Date.now() - lf.okTs > LBM_STALE_MS)) txt = 'Break check: monitor feed problem. ' + esc(lf.error || '');
+    else {
+      const c = compareBreaks();
+      txt = c.ready ? `Break check live · ${c.matched} agents compared${c.unmatched ? ' · ' + c.unmatched + ' not in the registry' : ''}` : 'Break check: waiting for fresh data…';
+    }
+    getRoster();
+    const flt = deptFilter();
+    const deptChips = rosterDepts.length
+      ? `<div class="gcc-depts"><span class="gcc-dept${flt.length ? '' : ' on'}" data-dept="*">All</span>${rosterDepts.map((d) => `<span class="gcc-dept${flt.indexOf(d) >= 0 ? ' on' : ''}" data-dept="${esc(d)}">${esc(d)}</span>`).join('')}</div>`
+      : '';
+    const noRoster = lf && lf.people && lf.people.length ? '' : '<div class="gcc-warn">No agent list yet: Focus, No Bubbles and Chat alerts need the Live Break Monitor feed (names and departments come from its registry).</div>';
+    return `<div class="gcc-brkbar"><span>${txt}</span><button class="gcc-brkn">${on ? '🔔 Notify on' : '🔕 Notify off'}</button></div>${deptChips}${noRoster}`;
+  }
+
   function evaluate(agent) {
     if (!agentHistory.has(agent.agent)) agentHistory.set(agent.agent, { statusHistory: [], alerts: {} });
     const data = agentHistory.get(agent.agent);
     const now = Date.now();
     const canAlert = (r) => !data.alerts[r] || now - data.alerts[r] > REPEAT_ALERT_COOLDOWN_MS;
     const mark = (r) => { data.alerts[r] = now; };
+    const mon = isMonitored(agent.agent);
+    if (!mon) ['nobubble', 'underchats', 'longchat', 'focus'].forEach((t) => clearAlert(agent.agent, t));
     const alertHook = (reason) => {
       if (!SEND_ALERTS) return;
       sendWebhook({
-        type: 'alert', agent: agent.agent, alertReason: reason, status: agent.status,
+        type: 'alert', agent: agent.agent, department: deptOfAgent(agent.agent), alertReason: reason, status: agent.status,
         current: agent.current, timestamp: new Date().toISOString(),
       });
     };
@@ -588,7 +765,7 @@
         if (!bubbleTimers.has(agent.agent)) bubbleTimers.set(agent.agent, now);
         const started = bubbleTimers.get(agent.agent);
         if (now - started >= 10000) {
-          if (isMonitored(agent.agent)) setAlert(agent.agent, 'nobubble', 'Offline ' + fmtSince(started));
+          if (mon) setAlert(agent.agent, 'nobubble', 'Offline ' + fmtSince(started));
           if (canAlert('nobubble')) mark('nobubble');
         }
       } else { bubbleTimers.delete(agent.agent); clearAlert(agent.agent, 'nobubble'); }
@@ -605,7 +782,7 @@
     // Under-3 chats
     const chats = agent.current.filter((x) => x.channel === 'chat');
     if (chats.length > 0 && chats.length < CHAT_ALERT_THRESHOLD) {
-      if (isMonitored(agent.agent)) {
+      if (mon) {
         setAlert(agent.agent, 'underchats', chats.length + ' active chat' + (chats.length === 1 ? '' : 's'));
       }
       if (canAlert('underchats')) { alertHook(chats.length + ' Chats'); mark('underchats'); }
@@ -614,7 +791,7 @@
     // Long chats
     chats.forEach((chat) => {
       if (chat.minutes >= CHAT_TOO_LONG_MIN) {
-        if (isMonitored(agent.agent)) setAlert(agent.agent, 'longchat', chat.durationText);
+        if (mon) setAlert(agent.agent, 'longchat', chat.durationText);
         if (canAlert('longchat')) { alertHook('Long Chat'); mark('longchat'); }
       }
     });
@@ -624,7 +801,7 @@
     const fstart = (GM_getValue('gcc_focus', {}) || {})[agent.agent];
     if ((agent.focus || (fstart && focusMiss.has(agent.agent))) && fstart) {
       const fmins = (now - fstart) / 60000;
-      if (isMonitored(agent.agent)) {
+      if (mon) {
         setAlert(agent.agent, 'focus', 'Since ' + new Date(fstart).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) + (fmins >= FOCUS_ALERT_MIN ? ' ⚠' : ''));
         const fa = activeAlerts.get(agent.agent + '::focus');
         if (fa) fa.since = fstart;
@@ -637,7 +814,7 @@
 
     if (SEND_SNAPSHOTS) {
       sendWebhook({
-        type: 'snapshot', agent: agent.agent, status: agent.status,
+        type: 'snapshot', agent: agent.agent, department: deptOfAgent(agent.agent), status: agent.status,
         focus: !!agent.focus, focusSince: fstart ? new Date(fstart).toISOString() : '',
         statusDurationText: agent.statusDurationText || '', bubbleCount: agent.bubbleCount,
         availability: agent.availability, current: agent.current, timestamp: new Date().toISOString(),
@@ -672,13 +849,21 @@
     if (JSON.stringify(next) !== JSON.stringify(prev)) GM_setValue('gcc_focus', next);
   }
 
-  function processAgents() {
+  let quietEval = false; // true while re-applying the department filter: no webhook snapshots / alerts
+  function processAgents(force) {
     const f = feeds.agents;
-    if (!f || !f.rows || f.ts === lastAgentsTs) return;
-    if (Date.now() - f.ts > VIEWS.agents.staleMs) return; // never alert on stale data
-    lastAgentsTs = f.ts;
+    if (!f || !f.rows || (!force && f.ts === lastAgentsTs)) return;
+    if (!force && Date.now() - f.ts > VIEWS.agents.staleMs) return; // never alert on stale data
+    if (!force) lastAgentsTs = f.ts;
     updateFocusMap(f.rows);
-    f.rows.forEach(evaluate);
+    quietEval = !!force;
+    try { f.rows.forEach(evaluate); } finally { quietEval = false; }
+  }
+  // department filter changed: re-evaluate the last Liveboard read right away
+  function reapplyDeptFilter() {
+    if (amLeader()) { processAgents(true); evaluateBreakCheck(); publishAlerts(); }
+    else { loadAlerts(); }
+    scheduleRender();
   }
 
   /* ---------- notifications for SLA ---------- */
@@ -686,10 +871,18 @@
     if (IS_VIEWER || !notifyEnabled || !amLeader()) return;
     const now = Date.now();
     let changed = false;
-    const nk = (c) => (role === 'emailopen' ? 'open|' : '') + c.id;
+    // key = conversation + due time: a conversation that gets a new due time (reply, reopen) can warn again
+    const nk = (c) => (role === 'emailopen' ? 'open|' : '') + c.id + '@' + c.due;
+    // forget old keys so the list does not grow forever (legacy keys without a due time go too)
+    Array.from(notifiedIds).forEach((k) => {
+      const at = k.lastIndexOf('@');
+      const due = at < 0 ? NaN : Date.parse(k.slice(at + 1));
+      if (isNaN(due) || due < now - 24 * 3600000) { notifiedIds.delete(k); changed = true; }
+    });
     cards.forEach((c) => {
       const ms = new Date(c.due).getTime() - now;
-      if (ms / 60000 <= NOTIFY_THRESHOLD_MIN && !notifiedIds.has(nk(c))) {
+      // warn inside the last NOTIFY_THRESHOLD_MIN; skip anything already >1h overdue (stops a flood of old items)
+      if (ms / 60000 <= NOTIFY_THRESHOLD_MIN && ms >= -3600000 && !notifiedIds.has(nk(c))) {
         try {
           GM_notification({
             title: role === 'emailopen' ? 'Gladly SLA warning (Open)' : 'Gladly SLA warning',
@@ -725,7 +918,7 @@
   function injectStyle() {
     const s = document.createElement('style');
     s.textContent = `
-      #gcc-panel{--bg:#0b0f19;--card:#111827;--line:#1f2937;--txt:#e5e7eb;--mut:#94a3b8;--w015:rgba(255,255,255,.015);--w02:rgba(255,255,255,.02);--w025:rgba(255,255,255,.025);--w03:rgba(255,255,255,.03);--w05:rgba(255,255,255,.05);--w06:rgba(255,255,255,.06);--w07:rgba(255,255,255,.07);--w08:rgba(255,255,255,.08);--w1:rgba(255,255,255,.1);--w15:rgba(255,255,255,.15);--w0:rgba(255,255,255,0);--name:#f1f5f9;--pre:#cbd5e1;--prebg:rgba(0,0,0,.25);--grip:#475569;--empty:#64748b;--stick:#141c2e;--headA:#131b2e;--headB:#0d1220;--scroll:#334155;--link:#93c5fd;--okc:#4ade80;--badc:#f87171;--warntx:#fcd34d;--shadowc:rgba(0,0,0,.6); position:fixed;bottom:16px;right:16px;width:520px;max-height:90vh;display:flex;flex-direction:column; background:var(--bg);color:var(--txt);border:1px solid var(--line);border-radius:18px; box-shadow:0 24px 70px var(--shadowc),0 0 0 1px var(--w03); font:13px/1.35 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif; z-index:1000000;overflow:hidden;-webkit-font-smoothing:antialiased}
+      #gcc-panel{--bg:#0e1118;--card:#171b25;--soft:#202533;--line:#272d3d;--txt:#eceff7;--mut:#8d95aa;--accent:#8b8cff;--accent-soft:#25264a;--on-accent:#0e1118;--ok:#4ade80;--warn:#fbbf24;--over:#fb7185;--shadow:0 1px 2px rgba(0,0,0,.3);--w015:rgba(255,255,255,.015);--w02:rgba(255,255,255,.02);--w025:rgba(255,255,255,.025);--w03:rgba(255,255,255,.03);--w05:rgba(255,255,255,.05);--w06:rgba(255,255,255,.06);--w07:rgba(255,255,255,.07);--w08:rgba(255,255,255,.08);--w1:rgba(255,255,255,.1);--w15:rgba(255,255,255,.15);--w0:rgba(255,255,255,0);--name:#eceff7;--pre:#cbd5e1;--prebg:rgba(0,0,0,.25);--grip:#8d95aa;--empty:#8d95aa;--stick:#171b25;--headA:#0e1118;--headB:#0e1118;--scroll:#272d3d;--link:#8b8cff;--okc:#4ade80;--badc:#fb7185;--warntx:#fbbf24;--shadowc:rgba(0,0,0,.6); position:fixed;bottom:16px;right:16px;width:520px;max-height:90vh;display:flex;flex-direction:column; background:var(--bg);color:var(--txt);border:1px solid var(--line);border-radius:18px; box-shadow:0 24px 70px var(--shadowc),0 0 0 1px var(--w03); font:13px/1.35 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif; z-index:1000000;overflow:hidden;-webkit-font-smoothing:antialiased}
       #gcc-panel *{box-sizing:border-box;scrollbar-width:thin;scrollbar-color:var(--scroll) transparent}
       #gcc-panel.gcc-wide{width:800px}
       #gcc-panel .gcc-head{display:flex;align-items:center;gap:8px;padding:10px 12px;background:linear-gradient(180deg,var(--headA),var(--headB));border-top:1px solid var(--line);user-select:none;order:3}
@@ -809,6 +1002,104 @@
       #gcc-panel.gcc-viewer[data-tab="all"] .gcc-sec{overflow:visible;min-height:auto}
       #gcc-panel.gcc-viewer[data-tab="all"] .gcc-sec-h{position:static}
       #gcc-panel.gcc-viewer:not([data-tab="all"]) .gcc-body>.gcc-sec{max-width:none}
+      #gcc-panel.gcc-viewer.gcc-4col[data-tab="all"] .gcc-body{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));grid-template-rows:minmax(0,1fr);overflow:hidden}
+      #gcc-panel.gcc-viewer.gcc-4col[data-tab="all"] .gcc-sec{overflow-y:auto;min-height:0}
+      #gcc-panel.gcc-viewer.gcc-4col[data-tab="all"] .gcc-sec-h{position:sticky}
+      @keyframes gccpulse{70%{box-shadow:0 0 0 8px rgba(34,197,94,0)}100%{box-shadow:0 0 0 0 rgba(34,197,94,0)}}
+      #gcc-panel .gcc-live.on{box-shadow:0 0 0 0 rgba(34,197,94,.6)}
+      #gcc-panel.gcc-light{--w015:rgba(15,23,42,.015);--w02:rgba(15,23,42,.02);--w025:rgba(15,23,42,.025);--w03:rgba(15,23,42,.03);--w05:rgba(15,23,42,.05);--w06:rgba(15,23,42,.06);--w07:rgba(15,23,42,.07);--w08:rgba(15,23,42,.08);--w1:rgba(15,23,42,.1);--w15:rgba(15,23,42,.15);--w0:rgba(15,23,42,0);--bg:#f5f6fa;--card:#ffffff;--soft:#eef0f6;--line:#e4e7ef;--txt:#161a26;--mut:#6c7489;--accent:#4f46e5;--accent-soft:#eceafd;--on-accent:#ffffff;--ok:#16a34a;--warn:#f59e0b;--over:#e11d48;--shadow:0 1px 2px rgba(20,25,45,.05),0 4px 14px rgba(20,25,45,.05);--name:#161a26;--pre:#334155;--prebg:rgba(15,23,42,.05);--grip:#94a3b8;--empty:#6c7489;--stick:#ffffff;--headA:#f5f6fa;--headB:#f5f6fa;--scroll:#cbd5e1;--link:#4f46e5;--okc:#16a34a;--badc:#e11d48;--warntx:#92400e;--shadowc:rgba(15,23,42,.16);}
+      #gcc-panel .gcc-brkbar{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 14px;font-size:11px;color:var(--mut);border-bottom:1px solid var(--line)}
+      #gcc-panel .gcc-brkn{font:inherit;font-size:11px;cursor:pointer;color:var(--txt);background:var(--w07);border:0;border-radius:8px;padding:4px 9px;white-space:nowrap}
+      #gcc-panel .gcc-dbg summary{padding:8px 14px;color:var(--mut);font-size:11px;cursor:pointer;border-top:1px solid var(--line)}
+
+      /* ===== v3.13 Live Break Monitor look: Inter, indigo accent, pill buttons, soft cards with a status bar ===== */
+      #gcc-panel .gcc-head{background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(10px);padding:12px 14px;gap:8px 6px;border-bottom:1px solid var(--line)}
+      #gcc-panel .gcc-brand{font-size:15px;font-weight:700;letter-spacing:-.01em;padding:5px 12px 5px 11px;border-radius:999px;background:var(--card);border:1px solid var(--line)}
+      #gcc-panel .gcc-live{width:8px;height:8px}
+      #gcc-panel .gcc-live.on{background:var(--ok);animation:gccbeat 1.6s ease-out infinite}
+      @keyframes gccbeat{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--ok) 55%,transparent)}100%{box-shadow:0 0 0 8px transparent}}
+      #gcc-panel .gcc-tabs{background:transparent;padding:0;gap:6px;flex-wrap:wrap}
+      #gcc-panel button{background:var(--card);border:1px solid var(--line);color:var(--txt);border-radius:999px;font-weight:600;transition:background .12s,border-color .12s,color .12s,transform .12s}
+      #gcc-panel button:hover{background:var(--card);border-color:var(--accent);color:var(--accent)}
+      #gcc-panel .gcc-tab{background:var(--card);color:var(--mut);padding:5px 12px;font-size:12.5px}
+      #gcc-panel .gcc-tab:hover{background:var(--card);color:var(--txt);border-color:var(--mut)}
+      #gcc-panel .gcc-tab.on,#gcc-panel .gcc-tab.on:hover{background:var(--txt);border-color:var(--txt);color:var(--bg);box-shadow:none}
+      #gcc-panel .gcc-ico{width:30px;height:30px;border-radius:50%}
+      #gcc-panel .gcc-body{padding:14px;gap:14px}
+      #gcc-panel .gcc-sec{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow)}
+      #gcc-panel .gcc-sec-h{padding:13px 15px 11px;font-size:14px;font-weight:700;letter-spacing:-.01em;background:transparent;border-bottom:0}
+      #gcc-panel .gcc-sub{font-size:11.5px;font-weight:650;background:var(--soft);color:var(--mut);padding:3px 10px;font-variant-numeric:tabular-nums}
+      #gcc-panel .gcc-chips{padding:0 15px 12px}
+      #gcc-panel .gcc-chip{border:1px solid color-mix(in srgb,currentColor 25%,transparent);font-weight:700}
+      /* two-row header: brand + tools on top, full-width tabs underneath */
+      #gcc-panel .gcc-brand{margin-right:auto}
+      #gcc-panel .gcc-tabs{order:5;flex:1 1 100%;min-width:0;display:flex;flex-wrap:wrap;gap:6px;margin-right:0;container-type:inline-size}
+      #gcc-panel .gcc-tab{flex:1 1 auto;min-width:0;display:flex;align-items:center;justify-content:center;gap:5px;padding:7px 8px;font-size:12.5px;white-space:nowrap}
+      #gcc-panel .gcc-tab .ic{flex:none}
+      /* narrow side panel: inactive tabs shrink to icon + count, the active tab keeps its name */
+      @container (max-width: 430px){
+        #gcc-panel .gcc-tab:not(.on) .lb{display:none}
+        #gcc-panel .gcc-tab{padding:7px 9px}
+      }
+      /* very narrow: icons only, still wraps instead of clipping */
+      @container (max-width: 240px){
+        #gcc-panel .gcc-tab.on .lb{display:none}
+      }
+      #gcc-panel .gcc-tb{min-width:18px;padding:1px 6px;border-radius:999px;font-size:11px;font-weight:800;line-height:16px;background:var(--soft);color:var(--mut);font-variant-numeric:tabular-nums}
+      #gcc-panel .gcc-tab.on .gcc-tb{background:color-mix(in srgb,var(--bg) 25%,transparent);color:var(--bg)}
+      #gcc-panel .gcc-tb.hot{background:#e11d48;color:#fff}
+      /* always-visible email SLA summary */
+      #gcc-panel .gcc-sum{order:0;padding:10px 14px 8px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:8px}
+      #gcc-panel .gcc-sumh{display:flex;align-items:center;justify-content:space-between;font-size:12px;font-weight:700;color:var(--mut);letter-spacing:.02em;text-transform:uppercase}
+      #gcc-panel .gcc-sumtog{height:24px;padding:0 10px;font-size:11.5px}
+      #gcc-panel .gcc-sumtiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(84px,1fr));gap:8px}
+      #gcc-panel .gcc-st{cursor:pointer;padding:8px 12px;border-radius:14px;background:var(--card);border:1px solid var(--line);border-left:4px solid var(--k,var(--accent));display:flex;flex-direction:column;gap:2px;transition:border-color .12s}
+      #gcc-panel .gcc-st:hover{border-color:var(--accent)}
+      #gcc-panel .gcc-st .l{font-size:11px;font-weight:700;color:var(--mut)}
+      #gcc-panel .gcc-st .n{font-size:24px;font-weight:800;line-height:1.05;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+      #gcc-panel .gcc-st .s{font-size:11px;color:var(--mut);font-variant-numeric:tabular-nums}
+      #gcc-panel .gcc-st .s b{color:#e11d48}
+      #gcc-panel .gcc-bk{width:100%;border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums}
+      #gcc-panel .gcc-bk th{font-size:11px;font-weight:700;color:var(--mut);text-align:right;padding:3px 6px}
+      #gcc-panel .gcc-bk th:first-child,#gcc-panel .gcc-bk td:first-child{text-align:left}
+      #gcc-panel .gcc-bk td{padding:4px 6px;text-align:right;border-top:1px solid var(--line)}
+      #gcc-panel .gcc-bk td:first-child{font-weight:650}
+      #gcc-panel .gcc-bk .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;vertical-align:baseline}
+      #gcc-panel .gcc-bk tr.tot td{font-weight:800;border-top:2px solid var(--line)}
+      #gcc-panel .gcc-bk .z{color:var(--mut);opacity:.55;font-weight:500}
+      #gcc-panel table{border-collapse:separate;border-spacing:0 8px;width:calc(100% - 20px);margin:-4px 10px 4px}
+      #gcc-panel td{background:var(--soft);padding:10px 13px;border-bottom:0}
+      #gcc-panel td:first-child{border-radius:13px 0 0 13px;box-shadow:inset 3px 0 0 var(--c,var(--accent))}
+      #gcc-panel td:last-child{border-radius:0 13px 13px 0}
+      #gcc-panel td:only-child{border-radius:13px}
+      #gcc-panel tbody tr:hover td{background:color-mix(in srgb,var(--accent) 8%,var(--soft))}
+      #gcc-panel .gcc-r{font-weight:750}
+      #gcc-panel a.gcc-name:hover{color:var(--accent)}
+      #gcc-panel .gcc-acc{padding:12px 15px 2px;border-top:0;background:transparent;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--mut)}
+      #gcc-panel .gcc-acc::before{box-shadow:none}
+      #gcc-panel .gcc-empty{margin:4px 10px 10px;padding:14px;border-radius:13px;background:var(--soft);font-size:12.5px;color:var(--mut)}
+      #gcc-panel .gcc-warn{border-radius:12px;background:color-mix(in srgb,var(--warn) 12%,var(--card));border:1px solid color-mix(in srgb,var(--warn) 45%,var(--line));color:var(--txt)}
+      #gcc-panel .gcc-warn a{color:var(--accent)}
+      #gcc-panel .gcc-brkbar{margin:0 10px 6px;padding:8px 12px;border:1px solid var(--line);border-radius:13px;background:var(--soft);color:var(--mut);font-size:11.5px}
+      #gcc-panel .gcc-brkn{background:var(--card);border:1px solid var(--line);border-radius:999px;font-weight:600}
+      #gcc-panel .gcc-brkn:hover{border-color:var(--accent);color:var(--accent)}
+      #gcc-panel .gcc-depts{display:flex;flex-wrap:wrap;gap:6px;padding:2px 10px 8px}
+      #gcc-panel .gcc-dept{padding:4px 11px;border-radius:999px;font-size:11px;font-weight:600;cursor:pointer;user-select:none;color:var(--mut);background:var(--card);border:1px solid var(--line)}
+      #gcc-panel .gcc-dept:hover{border-color:var(--accent);color:var(--accent)}
+      #gcc-panel .gcc-dept.on{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+      #gcc-panel .gcc-dtag{font-size:10.5px;color:var(--mut);font-weight:500}
+      #gcc-panel .gcc-export{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+      #gcc-panel .gcc-export:hover{background:var(--accent);color:var(--on-accent);opacity:.9}
+      #gcc-panel .gcc-exp{border-top:1px solid var(--line)}
+      #gcc-panel .gcc-foot{background:color-mix(in srgb,var(--bg) 88%,transparent);padding:8px 14px;gap:6px}
+      #gcc-panel .gcc-foot span{background:var(--card);border:1px solid var(--line);padding:3px 11px}
+      #gcc-panel .gcc-dbg summary{padding:9px 15px}
+      #gcc-panel .gcc-air-top .t{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--k);border-radius:14px;box-shadow:var(--shadow)}
+      #gcc-panel .gcc-air-row{background:var(--soft);border:0;border-radius:16px}
+      #gcc-panel .gcc-air-ico{background:var(--card)}
+      #gcc-panel .gcc-air-bar{background:var(--line)}
+      #gcc-panel .gcc-upd{background:transparent}
+      #gcc-panel.gcc-full[data-tab="all"] .gcc-sec-h{background:var(--card)}
       #gcc-panel.gcc-dock{top:0;right:0;bottom:0;left:auto;width:560px;max-width:100vw;max-height:none;border-radius:0;border-width:0 0 0 1px;z-index:2147483000}
       #gcc-panel.gcc-dock[data-size="wide"]{width:min(980px,100vw)}
       #gcc-panel.gcc-dock[data-size="full"]{width:100vw;font-size:14px}
@@ -822,23 +1113,16 @@
       #gcc-launch.gcc-launch-open{display:none}
       #gcc-launch .gcc-live{width:9px;height:9px;border-radius:50%;background:#64748b;flex:none}
       #gcc-launch .gcc-live.on{background:#22c55e}
-      @keyframes gccpulse{70%{box-shadow:0 0 0 8px rgba(34,197,94,0)}100%{box-shadow:0 0 0 0 rgba(34,197,94,0)}}
-      #gcc-panel .gcc-live.on{box-shadow:0 0 0 0 rgba(34,197,94,.6)}
-      #gcc-panel.gcc-light{--w015:rgba(15,23,42,.015);--w02:rgba(15,23,42,.02);--w025:rgba(15,23,42,.025);--w03:rgba(15,23,42,.03);--w05:rgba(15,23,42,.05);--w06:rgba(15,23,42,.06);--w07:rgba(15,23,42,.07);--w08:rgba(15,23,42,.08);--w1:rgba(15,23,42,.1);--w15:rgba(15,23,42,.15);--w0:rgba(15,23,42,0);--bg:#eef2f7;--card:#ffffff;--line:#e2e8f0;--txt:#0f172a;--mut:#64748b;--name:#0f172a;--pre:#334155;--prebg:rgba(15,23,42,.05);--grip:#94a3b8;--empty:#94a3b8;--stick:#f8fafc;--headA:#ffffff;--headB:#f8fafc;--scroll:#cbd5e1;--link:#2563eb;--okc:#15803d;--badc:#dc2626;--warntx:#92400e;--shadowc:rgba(15,23,42,.16);}
-      #gcc-panel .gcc-dbg summary{padding:8px 14px;color:var(--mut);font-size:11px;cursor:pointer;border-top:1px solid var(--line)}
-      #gcc-panel .gcc-tab.on{color:#fff}
     `;
     document.head.appendChild(s);
   }
 
-  let panel = null, launcher = null;
+  let panel = null;
   function buildPanel() {
     panel = document.createElement('div');
     panel.id = 'gcc-panel';
-    if (collapsed) panel.classList.add('gcc-collapsed');
     if (theme === 'light') panel.classList.add('gcc-light');
     panel.classList.add('gcc-viewer', 'gcc-dock');
-    panel.classList.remove('gcc-collapsed');
     panel.dataset.size = GM_getValue('gcc_size', 'narrow');
     if (!GM_getValue('gcc_open', false)) panel.classList.add('gcc-hidden');
     panel.innerHTML = `
@@ -847,18 +1131,47 @@
         <div class="gcc-brand"><span class="gcc-live" id="gcc-live"></span><span class="t">Command Center</span></div>
         <div class="gcc-tabs" id="gcc-tabs"></div>
         <button class="gcc-ico" id="gcc-notify" title="SLA notifications">${notifyEnabled ? '🔔' : '🔕'}</button>
+        <button class="gcc-ico" id="gcc-lbm" title="Live Break Monitor URL (for Break check and departments)">🕵️</button>
         <button class="gcc-ico" id="gcc-wide" title="Narrow / wide / full width">↔</button>
         <button class="gcc-ico" id="gcc-reload" title="Reload background frames">🔄</button>
         <button class="gcc-ico" id="gcc-frames-toggle" title="Background frames on/off">${framesEnabled ? '⏸' : '▶'}</button>
         <button class="gcc-ico" id="gcc-theme" title="Light / dark mode">${theme === 'light' ? '🌙' : '☀️'}</button>
         <button class="gcc-ico" id="gcc-collapse" title="Hide panel">✕</button>
       </div>
+      <div class="gcc-sum" id="gcc-sum"></div>
       <div class="gcc-body" id="gcc-body"></div>
       <div class="gcc-foot" id="gcc-foot"></div>`;
     document.body.appendChild(panel);
+    if (IS_VIEWER && window.ResizeObserver) {
+      // 4 side-by-side columns only when the Command Center itself (not the whole side panel) is wide enough
+      new ResizeObserver(() => panel.classList.toggle('gcc-4col', panel.clientWidth >= 1400)).observe(panel);
+    }
+
+    const pos = GM_getValue('pos', null);
+    if (pos) { panel.style.left = pos.left + 'px'; panel.style.top = pos.top + 'px'; panel.style.right = 'auto'; panel.style.bottom = 'auto'; }
+
+    // drag
+    let drag = null;
+    panel.querySelector('#gcc-grip').addEventListener('mousedown', (e) => {
+      const r = panel.getBoundingClientRect();
+      drag = { dx: e.clientX - r.left, dy: e.clientY - r.top };
+      e.preventDefault();
+    });
+    document.addEventListener('mousemove', (e) => {
+      if (!drag) return;
+      const left = Math.max(0, Math.min(window.innerWidth - 80, e.clientX - drag.dx));
+      const top = Math.max(0, Math.min(window.innerHeight - 40, e.clientY - drag.dy));
+      panel.style.left = left + 'px'; panel.style.top = top + 'px'; panel.style.right = 'auto'; panel.style.bottom = 'auto';
+    });
+    document.addEventListener('mouseup', () => {
+      if (!drag) return;
+      drag = null;
+      const r = panel.getBoundingClientRect();
+      GM_setValue('pos', { left: Math.round(r.left), top: Math.round(r.top) });
+    });
 
     // launcher tab (always visible on the right edge)
-    launcher = document.createElement('div');
+    const launcher = document.createElement('div');
     launcher.id = 'gcc-launch';
     launcher.title = 'Open / close Command Center';
     launcher.innerHTML = '<span class="gcc-live" id="gcc-live2"></span><span>CC</span>';
@@ -873,6 +1186,15 @@
     launcher.addEventListener('click', () => setOpen(panel.classList.contains('gcc-hidden')));
     panel.querySelector('#gcc-collapse').addEventListener('click', () => setOpen(false));
     GM_addValueChangeListener('gcc_open', (k, o, n, remote) => { if (remote) { panel.classList.toggle('gcc-hidden', !n); launcher.classList.toggle('gcc-launch-open', !!n); } });
+    panel.querySelector('#gcc-lbm').addEventListener('click', () => {
+      const v = prompt('Live Break Monitor web app URL (ends in /exec).\nLeave empty to turn Break check off:', GM_getValue('lbm_url', ''));
+      if (v === null) return;
+      const t = v.trim();
+      if (t && !LBM_URL_RE.test(t.split('?')[0])) { alert('That does not look like a web app URL (https://script.google.com/macros/s/.../exec).'); return; }
+      GM_setValue('lbm_url', t);
+      if (t) pollMonitor(); else { feeds.lbm = null; feedSet('lbm', { ok: false, okTs: 0, people: [] }); }
+      refreshAlerts(); render();
+    });
     panel.querySelector('#gcc-theme').addEventListener('click', (e) => {
       theme = theme === 'light' ? 'dark' : 'light';
       GM_setValue('gcc_theme', theme);
@@ -896,12 +1218,34 @@
       e.currentTarget.textContent = notifyEnabled ? '🔔' : '🔕';
     });
 
+    // summary strip: tiles jump to a tab, the button shows / hides the breakdown
+    panel.querySelector('#gcc-sum').addEventListener('click', (e) => {
+      if (e.target.closest('[data-sumtog]')) { GM_setValue('gcc_sum_open', !GM_getValue('gcc_sum_open', false)); render(); return; }
+      const t = e.target.closest('.gcc-st');
+      if (t && t.dataset.tab) { currentTab = t.dataset.tab; GM_setValue('tab', currentTab); render(); }
+    });
+
     // delegated clicks inside the body
     panel.querySelector('#gcc-body').addEventListener('click', (e) => {
       const chip = e.target.closest('.gcc-chip');
       if (chip && chip.dataset.role && bucketSets[chip.dataset.role]) {
         const l = chip.dataset.label, set = bucketSets[chip.dataset.role];
-        if (set.has(l)) set.delete(l); else set.add(l);
+        if (l === '*') set.clear();
+        else if (set.has(l)) set.delete(l); else set.add(l);
+        render(); return;
+      }
+      const dc = e.target.closest('.gcc-dept');
+      if (dc) {
+        const d = dc.dataset.dept;
+        let f = deptFilter().slice();
+        if (d === '*') f = [];
+        else if (f.indexOf(d) >= 0) f = f.filter((x) => x !== d);
+        else f.push(d);
+        GM_setValue('gcc_dept_filter', f);
+        render(); return;
+      }
+      if (e.target.closest('.gcc-brkn')) {
+        GM_setValue('gcc_brk_notify', !GM_getValue('gcc_brk_notify', true));
         render(); return;
       }
       const ex = e.target.closest('.gcc-export');
@@ -911,19 +1255,58 @@
       const go = e.target.closest('[data-goto]');
       if (go) {
         e.preventDefault();
-        window.open(location.origin + VIEWS[go.dataset.goto].path, '_blank');
+        const origin = IS_VIEWER ? GM_getValue('gcc_origin', '') : location.origin;
+        if (origin) window.open(origin + VIEWS[go.dataset.goto].path, '_blank');
       }
     });
   }
 
+  // tab bar: short names, with a live count on each (red when something is overdue)
+  function emailStats(role) {
+    const f = feeds[role], cards = (f && f.cards) || [], now = Date.now();
+    const counts = BUCKETS.map(() => 0);
+    cards.forEach((c) => { counts[BUCKETS.indexOf(bucketFor(new Date(c.due) - now))] += 1; });
+    return { has: !!f, n: cards.length, counts };
+  }
   function renderTabs() {
-    const tabs = [['all', '⊞ All']].concat(ROLES.map((r) => [r, VIEWS[r].icon + ' ' + VIEWS[r].label]));
+    const ea = emailStats('email'), eo = emailStats('emailopen');
+    const alertN = Array.from(activeAlerts.values()).filter((r) => alertInScope(r.agent)).length;
+    const tabs = [
+      ['all', '⊞', 'Overview', null, false],
+      ['email', '📧', 'New', ea.has ? ea.n : null, ea.counts[0] > 0],
+      ['emailopen', '📬', 'Open', eo.has ? eo.n : null, eo.counts[0] > 0],
+      ['agents', '🚨', 'Agents', alertN, alertN > 0],
+      ['airplane', '✈️', 'Airplane', null, false],
+    ];
     const el = panel.querySelector('#gcc-tabs');
-    el.innerHTML = tabs.map(([k, label]) => `<button class="gcc-tab${currentTab === k ? ' on' : ''}" data-tab="${k}">${label}</button>`).join('');
+    el.innerHTML = tabs.map(([k, ico, label, n, hot]) => `<button class="gcc-tab${currentTab === k ? ' on' : ''}" data-tab="${k}" title="${esc(label)}"><span class="ic">${ico}</span><span class="lb">${label}</span>${n === null ? '' : `<span class="gcc-tb${hot ? ' hot' : ''}">${n}</span>`}</button>`).join('');
     el.querySelectorAll('.gcc-tab').forEach((b) => b.addEventListener('click', () => {
       currentTab = b.dataset.tab; GM_setValue('tab', currentTab);
       render();
     }));
+  }
+
+  // short Email SLA summary (always visible): total, New, Open + optional breakdown by time left
+  function renderSummary() {
+    const box = panel.querySelector('#gcc-sum');
+    if (!box) return;
+    const a = emailStats('email'), b = emailStats('emailopen');
+    if (!a.has && !b.has) { box.style.display = 'none'; return; }
+    box.style.display = '';
+    const open = GM_getValue('gcc_sum_open', false);
+    const total = a.n + b.n, over = a.counts[0] + b.counts[0], soon = a.counts[1] + b.counts[1];
+    const sub = (c) => (c[0] ? `<b>${c[0]} overdue</b>` : '0 overdue') + ` · ${c[1]} under 1h`;
+    const tile = (tab, label, n, subHtml, k) => `<div class="gcc-st" data-tab="${tab}" style="--k:${k}" title="Open this tab"><span class="l">${label}</span><span class="n">${n}</span><span class="s">${subHtml}</span></div>`;
+    const cell = (v) => (v ? v : '<span class="z">0</span>');
+    const rows = BUCKETS.map((bk, i) => `<tr><td><span class="dot" style="background:${BC(bk)}"></span>${bk.label}</td><td>${cell(a.counts[i])}</td><td>${cell(b.counts[i])}</td><td>${cell(a.counts[i] + b.counts[i])}</td></tr>`).join('');
+    box.innerHTML = `
+      <div class="gcc-sumh"><span>📊 Email SLA (${SLA_HOURS}h)</span><button class="gcc-sumtog" data-sumtog="1">${open ? 'Hide breakdown ▴' : 'Show breakdown ▾'}</button></div>
+      <div class="gcc-sumtiles">
+        ${tile('all', 'Total emails', total, (over ? `<b>${over} overdue</b>` : '0 overdue') + ` · ${soon} under 1h`, '#6366f1')}
+        ${tile('email', 'New', a.n, sub(a.counts), '#3b82f6')}
+        ${tile('emailopen', 'Open', b.n, sub(b.counts), '#14b8a6')}
+      </div>
+      ${open ? `<table class="gcc-bk"><thead><tr><th>Time left</th><th>New</th><th>Open</th><th>Total</th></tr></thead><tbody>${rows}<tr class="tot"><td>Total</td><td>${a.n}</td><td>${b.n}</td><td>${total}</td></tr></tbody></table>` : ''}`;
   }
 
   function feedStatus(role) {
@@ -960,12 +1343,16 @@
       const nm = c.link ? `<a class="gcc-name" href="${esc(c.link)}" target="_blank" rel="noopener">${esc(c.name)}</a>` : `<span class="gcc-name">${esc(c.name)}</span>`;
       return `<tr style="--c:${BC(b)}"><td>${nm}<div class="gcc-subj">${esc(c.subject)}</div></td><td class="gcc-r" style="color:${BC(b)}">${fmtRemaining(ms)}</td></tr>`;
     }).join('');
-    const scanInfo = f ? `${cards.length} emails · ${f.pages} page${f.pages === 1 ? '' : 's'}${f.complete ? '' : ' (current page only)'}` : '';
+    const le12 = cards.filter((c) => new Date(c.due) - now < 12 * 3600000).length;   // includes overdue
+    const mid = cards.filter((c) => { const m = new Date(c.due) - now; return m >= 12 * 3600000 && m <= SLA_MAX_MS; }).length;
+    const beyond = cards.filter((c) => new Date(c.due) - now > SLA_HOURS * 3600000 + SLA_SLACK_MIN * 60000).length;
+    const scanInfo = f ? `${cards.length} emails · ${f.pages} page${f.pages === 1 ? '' : 's'}${f.complete ? '' : ' (current page only)'}${beyond ? ` · ⚠ ${beyond} due beyond ${SLA_HOURS}h` : ''}` : '';
     return `
       <div class="gcc-sec">
-        <div class="gcc-sec-h"><span>${role === 'emailopen' ? '📬 Open Email SLA' : '📧 Email SLA'} (${SLA_HOURS}h)</span><span class="gcc-sub">${esc(scanInfo)}</span></div>
+        <div class="gcc-sec-h"><span>${role === 'emailopen' ? '📬 Open Email SLA' : '📧 Email SLA'} (${SLA_HOURS}h)</span><span class="gcc-sub"${beyond ? ` title="${beyond} email(s) show a due time more than ${SLA_HOURS}h away, so Gladly's SLA for them is not ${SLA_HOURS}h. Check the SLA policy in Gladly."` : ''}>${esc(scanInfo)}</span></div>
         ${noDataWarn(role)}
-        <div class="gcc-chips">${counts.map((b) => `<span class="gcc-chip${emailBuckets.has(b.label) ? ' on' : ''}" data-role="${role}" data-label="${esc(b.label)}" style="background:${BB(b)};color:${BC(b)}">${b.label}: ${b.count}</span>`).join('')}</div>
+        ${cards.length ? `<div class="gcc-total" style="padding:2px 14px 0;font-size:12px;color:var(--mut);font-variant-numeric:tabular-nums"><b style="color:var(--txt)">Total ${cards.length} email${cards.length === 1 ? '' : 's'}</b> · ${counts[0].count} overdue · ${le12} with 12h or less left · ${mid} with 12-${SLA_HOURS}h left${beyond ? ` · <span style="color:#f59e0b">${beyond} over ${SLA_HOURS}h left</span>` : ''}</div>` : ''}
+        <div class="gcc-chips"><span class="gcc-chip${emailBuckets.size === 0 ? ' on' : ''}" data-role="${role}" data-label="*" style="background:rgba(148,163,184,.18);color:var(--txt)">All: ${cards.length}</span>${counts.map((b) => `<span class="gcc-chip${emailBuckets.has(b.label) ? ' on' : ''}" data-role="${role}" data-label="${esc(b.label)}" style="background:${BB(b)};color:${BC(b)}">${b.label}: ${b.count}</span>`).join('')}</div>
         ${sel.length ? `<table><tbody>${rows}</tbody></table>` : `<div class="gcc-empty">${cards.length ? 'No emails in the selected filter.' : 'No emails.'}</div>`}
         ${cards.length ? `<div class="gcc-exp"><button class="gcc-export" data-role="${role}">⬇ Export CSV</button></div>` : ''}
       </div>`;
@@ -975,13 +1362,14 @@
     const f = feeds.agents;
     const n = f && f.rows ? f.rows.length : 0;
     const blocks = Object.keys(PANEL_TYPES).map((type) => {
-      const rows = Array.from(activeAlerts.values()).filter((r) => r.type === type).sort((a, b) => a.since - b.since);
+      const rows = Array.from(activeAlerts.values()).filter((r) => r.type === type && alertInScope(r.agent)).sort((a, b) => a.since - b.since);
       const cfg = PANEL_TYPES[type];
       return `<div class="gcc-acc" style="--a:${cfg.accent}">${cfg.title} (${rows.length})</div>
         ${rows.length
           ? `<table><tbody>${rows.map((r) => {
               const hot = type === 'focus' && Date.now() - r.since >= FOCUS_ALERT_MIN * 60000;
-              return `<tr><td>${esc(r.agent)}</td><td>${esc(r.detail)}</td><td class="gcc-r"${hot ? ' style="color:var(--badc)"' : ''}>${fmtSince(r.since)}</td></tr>`;
+              const dp = deptOfAgent(r.agent);
+              return `<tr><td>${esc(r.agent)}${dp ? `<div class="gcc-dtag">${esc(dp)}</div>` : ''}</td><td>${esc(r.detail)}</td><td class="gcc-r"${hot ? ' style="color:var(--badc)"' : ''}>${fmtSince(r.since)}</td></tr>`;
             }).join('')}</tbody></table>`
           : `<div class="gcc-empty">No active alerts</div>`}`;
     }).join('');
@@ -989,6 +1377,7 @@
       <div class="gcc-sec">
         <div class="gcc-sec-h"><span>🚨 Agent Liveboard</span><span class="gcc-sub">${n} agents · ${f && f.rows ? f.rows.filter((r) => r.focus).length : 0} in focus</span></div>
         ${noDataWarn('agents')}
+        ${breakCheckBar()}
         ${blocks}
         ${n && f.dbg && f.dbg.length ? `<details class="gcc-dbg"><summary>Focus detection info</summary><div class="gcc-pre">Focus-like markers left of the name (state, agents with it):\n${esc((f.finfo || []).map((x) => ' • ' + x.t + '  [' + x.state + ', ' + x.n + '/' + x.total + ']').join('\n') || ' (none found)')}\n\nMarkup left of the first agents (send this if focus is wrong):\n\n${esc(f.dbg.join('\n\n'))}</div></details>` : ''}
       </div>`;
@@ -1089,6 +1478,7 @@
   function render() {
     if (!panel) { notifyAll(); return; }
     renderTabs();
+    renderSummary();
     panel.dataset.tab = currentTab;
     const body = panel.querySelector('#gcc-body');
     const keepScroll = body.scrollTop;
@@ -1127,10 +1517,13 @@
   buildPanel();
   GM_addValueChangeListener('notifyEnabled', (k, o, n, remote) => { if (remote) { notifyEnabled = !!n; const b = panel.querySelector('#gcc-notify'); if (b) b.textContent = notifyEnabled ? '🔔' : '🔕'; } });
   GM_addValueChangeListener('framesEnabled', (k, o, n, remote) => { if (remote) { framesEnabled = n !== false; buildFrames(); } });
+  GM_addValueChangeListener('gcc_dept_filter', () => reapplyDeptFilter());
   buildFrames();
   refreshAlerts();
   render();
   setInterval(() => { refreshAlerts(); render(); }, 5000);
+  setInterval(pollMonitor, LBM_POLL_MS);
+  pollMonitor();
   setInterval(() => {
     const lead = amLeader();
     if (lead && framesEnabled && !framesHost) buildFrames();
